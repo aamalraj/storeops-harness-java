@@ -10,3 +10,7 @@ target/
 .classpath
 .project
 .settings/
+
+# Harness working files — only .harness/reviews/ is the permanent audit trail
+.harness/output/*
+!.harness/output/.gitkeep
