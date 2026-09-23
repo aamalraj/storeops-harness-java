@@ -1,0 +1,11 @@
+target/
+.git/
+.idea/
+.vscode/
+*.iml
+.harness/output/
+.harness/reviews/
+*.md
+Dockerfile
+docker-compose.yml
+.dockerignore
