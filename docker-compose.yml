@@ -1,0 +1,18 @@
+services:
+  storeops-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: storeops-api:local
+    container_name: storeops-api
+    ports:
+      - "8080:8080"
+    # In-memory storage — no database service to wire up here. Add environment overrides
+    # (e.g. SPRING_PROFILES_ACTIVE, SERVER_PORT) only if a future sprint needs config that
+    # differs from src/main/resources/application.yml in a containerised run.
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/actuator/health"]
+      interval: 15s
+      timeout: 3s
+      start_period: 30s
+      retries: 5
