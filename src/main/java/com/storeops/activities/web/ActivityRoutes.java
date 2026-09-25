@@ -1,6 +1,8 @@
 package com.storeops.activities.web;
 
 import com.storeops.activities.dto.ActivityResponse;
+import com.storeops.activities.dto.BulkStatusUpdateRequest;
+import com.storeops.activities.dto.BulkStatusUpdateResponse;
 import com.storeops.activities.dto.CreateActivityRequest;
 import com.storeops.activities.dto.UpdateActivityRequest;
 import com.storeops.activities.service.ActivityService;
@@ -61,6 +63,16 @@ public class ActivityRoutes {
   @GetMapping("/{id}")
   public ActivityResponse getById(@AuthenticatedActor Actor actor, @PathVariable String id) {
     return ActivityResponse.from(activityService.getById(actor, id));
+  }
+
+  /**
+   * PATCH /api/activities/bulk-status — shift handover close-out: transition multiple
+   * activities to DONE or BLOCKED in one call. Always 200 OK; per-item outcomes are in the body.
+   */
+  @PatchMapping("/bulk-status")
+  public BulkStatusUpdateResponse bulkUpdateStatus(
+      @AuthenticatedActor Actor actor, @RequestBody BulkStatusUpdateRequest request) {
+    return activityService.bulkUpdateStatus(actor, request);
   }
 
   /** PATCH /api/activities/{id} — update status, priority, category and/or assignee. */

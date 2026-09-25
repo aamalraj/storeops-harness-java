@@ -1,5 +1,6 @@
 package com.storeops.activities.web;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -8,6 +9,7 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.storeops.support.ActorHeaders;
 import java.util.LinkedHashMap;
@@ -18,6 +20,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
 
@@ -230,6 +233,139 @@ class ActivityRoutesTest {
         .andExpect(jsonPath("$.code").value("FORBIDDEN"));
   }
 
+  @Test
+  @DisplayName("PATCH /api/activities/bulk-status reports per-item outcomes, not one status "
+      + "for the whole batch")
+  void bulkUpdateReportsMixedOutcomes() throws Exception {
+    String blocked = createActivity("Count backroom stock", null);
+    patchStatus(blocked, "BLOCKED");
+    String inProgress = createActivity("Face up aisle 4", null);
+    patchStatus(inProgress, "IN_PROGRESS");
+    String closed = createActivity("Already archived", null);
+    patchStatus(closed, "DONE");
+
+    // Baselines account for the ACTIVITY_UPDATED events the setup patches above already fired —
+    // what matters is how many more this bulk call raises, not the absolute count.
+    long blockedBefore = countAlertsFor(blocked);
+    long inProgressBefore = countAlertsFor(inProgress);
+    long closedBefore = countAlertsFor(closed);
+
+    mockMvc.perform(patch("/api/activities/bulk-status")
+            .headers(ActorHeaders.associate())
+            .contentType(MediaType.APPLICATION_JSON)
+            .content("{\"updates\": ["
+                + "{\"id\": \"" + blocked + "\", \"status\": \"DONE\"},"
+                + "{\"id\": \"" + inProgress + "\", \"status\": \"BLOCKED\"},"
+                + "{\"id\": \"" + closed + "\", \"status\": \"DONE\"}"
+                + "]}"))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.results[0].id").value(blocked))
+        .andExpect(jsonPath("$.results[0].succeeded").value(true))
+        .andExpect(jsonPath("$.results[0].status").value("DONE"))
+        .andExpect(jsonPath("$.results[1].id").value(inProgress))
+        .andExpect(jsonPath("$.results[1].succeeded").value(true))
+        .andExpect(jsonPath("$.results[1].status").value("BLOCKED"))
+        .andExpect(jsonPath("$.results[2].id").value(closed))
+        .andExpect(jsonPath("$.results[2].succeeded").value(false))
+        .andExpect(jsonPath("$.results[2].errorCode").value("CONFLICT"))
+        .andExpect(jsonPath("$.results[2].status").doesNotExist());
+
+    // An ACTIVITY_UPDATED event — observed here via the alert it raises — is published for each
+    // succeeded item and withheld for the failed one.
+    assertThat(countAlertsFor(blocked) - blockedBefore).isEqualTo(1);
+    assertThat(countAlertsFor(inProgress) - inProgressBefore).isEqualTo(1);
+    assertThat(countAlertsFor(closed) - closedBefore).isEqualTo(0);
+  }
+
+  @Test
+  @DisplayName("PATCH /api/activities/bulk-status rejects a target status other than DONE/BLOCKED")
+  void bulkUpdateRejectsUnsupportedTargetStatus() throws Exception {
+    String id = createActivity("Rotate stock", null);
+
+    mockMvc.perform(patch("/api/activities/bulk-status")
+            .headers(ActorHeaders.associate())
+            .contentType(MediaType.APPLICATION_JSON)
+            .content("{\"updates\": [{\"id\": \"" + id + "\", \"status\": \"IN_PROGRESS\"}]}"))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.results[0].succeeded").value(false))
+        .andExpect(jsonPath("$.results[0].errorCode").value("VALIDATION_FAILED"))
+        .andExpect(jsonPath("$.results[0].errorMessage")
+            .value(containsString("DONE, BLOCKED")));
+  }
+
+  @Test
+  @DisplayName("PATCH /api/activities/bulk-status reports an id from another store as NOT_FOUND")
+  void bulkUpdateHidesActivitiesFromOtherStores() throws Exception {
+    String foreignId = createActivityAt(
+        "Store two only", ActorHeaders.of(ActorHeaders.OTHER_STORE_ASSOCIATE,
+            ActorHeaders.OTHER_STORE, "ASSOCIATE"));
+
+    mockMvc.perform(patch("/api/activities/bulk-status")
+            .headers(ActorHeaders.associate())
+            .contentType(MediaType.APPLICATION_JSON)
+            .content("{\"updates\": [{\"id\": \"" + foreignId + "\", \"status\": \"DONE\"}]}"))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.results[0].succeeded").value(false))
+        .andExpect(jsonPath("$.results[0].errorCode").value("NOT_FOUND"));
+  }
+
+  @Test
+  @DisplayName("PATCH /api/activities/bulk-status succeeds for every item in an all-success batch")
+  void bulkUpdateAllSucceed() throws Exception {
+    String first = createActivity("Reset end cap", null);
+    patchStatus(first, "BLOCKED");
+    String second = createActivity("Check chiller temperatures", null);
+    patchStatus(second, "BLOCKED");
+
+    mockMvc.perform(patch("/api/activities/bulk-status")
+            .headers(ActorHeaders.associate())
+            .contentType(MediaType.APPLICATION_JSON)
+            .content("{\"updates\": ["
+                + "{\"id\": \"" + first + "\", \"status\": \"DONE\"},"
+                + "{\"id\": \"" + second + "\", \"status\": \"DONE\"}"
+                + "]}"))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.results[0].succeeded").value(true))
+        .andExpect(jsonPath("$.results[1].succeeded").value(true));
+  }
+
+  @Test
+  @DisplayName("PATCH /api/activities/bulk-status rejects an empty updates list with 400")
+  void bulkUpdateRejectsEmptyBatch() throws Exception {
+    mockMvc.perform(patch("/api/activities/bulk-status")
+            .headers(ActorHeaders.associate())
+            .contentType(MediaType.APPLICATION_JSON)
+            .content("{\"updates\": []}"))
+        .andExpect(status().isBadRequest())
+        .andExpect(jsonPath("$.code").value("VALIDATION_FAILED"))
+        .andExpect(jsonPath("$.message").value(containsString("At least one update")));
+  }
+
+  /** Counts alerts raised by an ACTIVITY_UPDATED event for the activity {@code id}. */
+  private long countAlertsFor(String id) throws Exception {
+    String response = mockMvc.perform(get("/api/alerts").headers(ActorHeaders.associate()))
+        .andExpect(status().isOk())
+        .andReturn().getResponse().getContentAsString();
+    long count = 0;
+    for (JsonNode alert : objectMapper.readTree(response)) {
+      boolean matches = id.equals(alert.path("sourceAggregateId").asText(null))
+          && "ACTIVITY_UPDATED".equals(alert.path("sourceEventType").asText(null));
+      if (matches) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  /** Applies a single-field status patch, used here only to set up bulk-update test fixtures. */
+  private void patchStatus(String id, String status) throws Exception {
+    mockMvc.perform(patch("/api/activities/" + id)
+            .headers(ActorHeaders.associate())
+            .contentType(MediaType.APPLICATION_JSON)
+            .content("{\"status\": \"" + status + "\"}"))
+        .andExpect(status().isOk());
+  }
+
   /** Creates an activity as the default associate and returns its id. */
   private String createActivity(String title, String programmeId) throws Exception {
     Map<String, String> body = new LinkedHashMap<>();
@@ -240,6 +376,20 @@ class ActivityRoutesTest {
     }
     String response = mockMvc.perform(post("/api/activities")
             .headers(ActorHeaders.associate())
+            .contentType(MediaType.APPLICATION_JSON)
+            .content(objectMapper.writeValueAsString(body)))
+        .andExpect(status().isCreated())
+        .andReturn().getResponse().getContentAsString();
+    return objectMapper.readTree(response).get("id").asText();
+  }
+
+  /** Creates an activity as whichever caller {@code headers} identifies, and returns its id. */
+  private String createActivityAt(String title, HttpHeaders headers) throws Exception {
+    Map<String, String> body = new LinkedHashMap<>();
+    body.put("title", title);
+    body.put("category", "MERCHANDISING");
+    String response = mockMvc.perform(post("/api/activities")
+            .headers(headers)
             .contentType(MediaType.APPLICATION_JSON)
             .content(objectMapper.writeValueAsString(body)))
         .andExpect(status().isCreated())

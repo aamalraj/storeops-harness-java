@@ -4,10 +4,13 @@ import com.storeops.activities.domain.Activity;
 import com.storeops.activities.domain.ActivityCategory;
 import com.storeops.activities.domain.ActivityPriority;
 import com.storeops.activities.domain.ActivityStatus;
+import com.storeops.activities.dto.BulkStatusUpdateRequest;
+import com.storeops.activities.dto.BulkStatusUpdateResponse;
 import com.storeops.activities.dto.CreateActivityRequest;
 import com.storeops.activities.dto.UpdateActivityRequest;
 import com.storeops.activities.repository.ActivityRepository;
 import com.storeops.common.auth.Actor;
+import com.storeops.common.error.AppError;
 import com.storeops.common.error.ConflictError;
 import com.storeops.common.error.ForbiddenError;
 import com.storeops.common.error.NotFoundError;
@@ -18,6 +21,7 @@ import com.storeops.common.events.EventBus;
 import com.storeops.common.util.Enums;
 import com.storeops.staff.api.StaffDirectory;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.List;
@@ -122,6 +126,57 @@ public class ActivityService {
     publish(DomainEventType.ACTIVITY_UPDATED, saved, actor,
         Map.of("status", saved.status().name(), "priority", saved.priority().name()));
     return saved;
+  }
+
+  /**
+   * Transitions a batch of activities to DONE or BLOCKED — the shift handover close-out flow.
+   *
+   * <p>Each item is processed independently: one item's failure is recorded in that item's
+   * {@link BulkStatusUpdateResponse.Outcome} and does not stop the remaining items from being
+   * attempted. An {@code ACTIVITY_UPDATED} event is published only for items that succeed.
+   */
+  public BulkStatusUpdateResponse bulkUpdateStatus(Actor actor, BulkStatusUpdateRequest request) {
+    List<BulkStatusUpdateRequest.Item> items = request.updates();
+    if (items == null || items.isEmpty()) {
+      throw new ValidationError("At least one update must be supplied");
+    }
+
+    List<BulkStatusUpdateResponse.Outcome> outcomes = new ArrayList<>();
+    for (BulkStatusUpdateRequest.Item item : items) {
+      outcomes.add(applyBulkStatusItem(actor, item));
+    }
+    return new BulkStatusUpdateResponse(outcomes);
+  }
+
+  private BulkStatusUpdateResponse.Outcome applyBulkStatusItem(
+      Actor actor, BulkStatusUpdateRequest.Item item) {
+    try {
+      if (item.id() == null || item.id().isBlank()) {
+        throw new ValidationError("id must not be blank");
+      }
+      ActivityStatus target = parseBulkTargetStatus(item.status());
+      Activity activity = getById(actor, item.id());
+      if (activity.isClosed()) {
+        throw new ConflictError("Activity '" + item.id() + "' is " + activity.status()
+            + " and cannot be modified");
+      }
+      Activity saved = repository.save(activity.withStatus(target, Instant.now()));
+      publish(DomainEventType.ACTIVITY_UPDATED, saved, actor,
+          Map.of("status", saved.status().name()));
+      return BulkStatusUpdateResponse.Outcome.success(saved.id(), saved.status());
+    } catch (AppError error) {
+      return BulkStatusUpdateResponse.Outcome.failure(item.id(), error);
+    }
+  }
+
+  /** Bulk-status is narrower than the general update: only DONE or BLOCKED are accepted. */
+  private static ActivityStatus parseBulkTargetStatus(String raw) {
+    ActivityStatus status = Enums.parse(ActivityStatus.class, raw, "status");
+    if (status != ActivityStatus.DONE && status != ActivityStatus.BLOCKED) {
+      throw new ValidationError(
+          "status must be one of [DONE, BLOCKED] for bulk updates, but was '" + status + "'");
+    }
+    return status;
   }
 
   /**
